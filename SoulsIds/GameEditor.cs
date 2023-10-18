@@ -187,7 +187,7 @@ namespace SoulsIds
                 string bndName = BaseName(file.Name);
                 try
                 {
-                    T res = parser(file.Bytes, bndName);
+                    T res = parser(file.Bytes.ToArray(), bndName);
                     if (res != null) bnds[bndName] = res;
                 }
                 catch (Exception ex)
@@ -235,7 +235,7 @@ namespace SoulsIds
                 byte[] data = File.ReadAllBytes(path);
                 if (DCX.Is(data))
                 {
-                    data = DCX.Decompress(data);
+                    data = DCX.Decompress(data).ToArray();
                 }
                 if (BND4.Is(data))
                 {
