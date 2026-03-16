@@ -25,18 +25,26 @@ namespace SoulsIds
             Event,
             EventFlag,
             ESD,
+            Machine,
             Lot,
             Shop,
             NPC,
             Material,
             Skill,
             // Item types in order
-            Weapon,
-            Protector,
-            Accessory,
-            Goods,
-            Gem,
-            Arts,
+            Weapon, // 0
+            Protector, // 1
+            Accessory, // 2
+            Goods, // 3
+            Gem, // 4 in ER shop and 5 in lot, but not supported by scripting
+            Arts, // TODO remove, redundant to gem
+            CustomWeapon, // 6 in NR and ER lot
+            Antique, // 7 in NR lot
+            Booster, // 4 in AC6 shop
+            Fcs, // 5 in AC6 shop
+            Generator, // 6 in AC6 shop
+            ItemTable, // 5 in NR shop
+            // End of items
             Talk,
             Dialogue,
             Entity,
@@ -51,6 +59,12 @@ namespace SoulsIds
             ActionButton,
             ActionButtonText,
             Gesture,
+            TextEffect,
+            // AC6
+            Account,
+            Mission,
+            Arena,
+            Tutorial,
             // In future
             Cutscene,
             Achievement,
@@ -58,7 +72,12 @@ namespace SoulsIds
             SpEffect,
             SFX,
         }
-        private static HashSet<Namespace> Quotes = new HashSet<Namespace> { Namespace.Action, Namespace.Dialogue, Namespace.Talk, Namespace.ActionButton };
+
+        private static readonly HashSet<Namespace> Quotes = new()
+        {
+            Namespace.Action, Namespace.Dialogue, Namespace.Talk, Namespace.ActionButton, Namespace.ActionButtonText, Namespace.TextEffect,
+        };
+
         public class Obj : IComparable<Obj>
         {
             public string ID { get; set; }
@@ -99,7 +118,7 @@ namespace SoulsIds
             // Helpers
             public static Obj Lot(int id) => new Obj(id, Namespace.Lot);
             public static Obj Shop(int id, int end=-1) => new Obj(id, Namespace.Shop, end);
-            public static Obj EventFlag(int id, int end=-1) => new Obj(id, Namespace.EventFlag, end);
+            public static Obj EventFlag(int id, int end = -1) => new Obj(id, Namespace.EventFlag, end);
             public static Obj EventFlag(uint id, int end = -1) => new Obj(id, Namespace.EventFlag, end);
             public static Obj Talk(int id) => new Obj(id, Namespace.Talk);
             public static Obj Action(int id) => new Obj(id, Namespace.Action);
@@ -116,22 +135,43 @@ namespace SoulsIds
             public static Obj Dialogue(int id) => new Obj(id, Namespace.Dialogue);
             public static Obj Bonfire(int id) => new Obj(id, Namespace.Bonfire);
             public static Obj Human(int id) => new Obj(id, Namespace.Human);
+            public static Obj TextEffect(int id) => new Obj(id, Namespace.TextEffect);
 
             // For names
             public static Obj Of(Namespace type, object id) => new Obj(id, type);
 
-            public static Obj Item(uint type, int id) {
-                Namespace n;
-                if (type > 10)
+            // Type can be a lot type in bit representation, or a shop item type.
+            // For lot types in Elden Ring and later, manually map the type instead
+            public static Obj Item(uint type, int id)
+            {
+                if (!LotTypes.TryGetValue(type, out int itemType))
                 {
-                    n = Namespace.Weapon + LotTypes[type];
+                    // Up to gem in script/shop mapping
+                    if (type <= 4)
+                    {
+                        itemType = (int)type;
+                    }
+                    else return UnknownItem(type, id);
                 }
-                else
-                {
-                    n = Namespace.Weapon + (int)type;
-                }
-                return new Obj(id.ToString(), n);
+                return Of(Namespace.Weapon + itemType, id);
             }
+
+            public static Obj AC6Item(int type, int id)
+            {
+                Namespace n;
+                if (type >= 0 && type < 4)
+                {
+                    n = Namespace.Weapon + type;
+                }
+                // idk. It's 4 5 6 in EquipmentLineupParam?
+                else if (type == 6) n = Namespace.Booster;
+                else if (type == 7) n = Namespace.Fcs;
+                else if (type == 5) n = Namespace.Generator;
+                else return UnknownItem(type, id);
+                return Of(n, id);
+            }
+
+            private static Obj UnknownItem(object type, object id) => new Obj($"{type}:{id}", Namespace.Item);
         }
         public enum Verb
         {

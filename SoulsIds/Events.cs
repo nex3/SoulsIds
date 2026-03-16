@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using SoulsFormats;
 using static SoulsFormats.EMEVD.Instruction;
+using System.Net;
 
 namespace SoulsIds
 {
@@ -96,12 +97,14 @@ namespace SoulsIds
         private readonly bool darkScriptMode;
         private readonly bool paramAwareMode;
         private readonly bool liteMode;
+        private readonly bool skipAwareMode;
 
         public Events(
             string emedfPath,
             bool darkScriptMode = false,
             bool paramAwareMode = false,
-            List<InstructionValueSpec> valueSpecs = null)
+            List<InstructionValueSpec> valueSpecs = null,
+            bool skipAwareMode = false)
         {
             if (emedfPath == null)
             {
@@ -137,6 +140,7 @@ namespace SoulsIds
             }
             this.darkScriptMode = darkScriptMode;
             this.paramAwareMode = paramAwareMode;
+            this.skipAwareMode = skipAwareMode;
 
             docByName = doc.Classes.SelectMany(c => c.Instructions.Select(i => (i, (int)c.Index))).ToDictionary(i => i.Item1.Name, i => (i.Item2, (int)i.Item1.Index));
             funcBytePositions = new Dictionary<EMEDF.InstrDoc, List<int>>();
@@ -189,7 +193,7 @@ namespace SoulsIds
                         }
                         if (darkScriptMode && !liteMode)
                         {
-                            arg.Name = CamelCaseName(arg.Name);
+                            arg.DisplayName = TitleCaseName(arg.Name, true);
                         }
                     }
                     // Final int padding. Add a final one for overall length
@@ -198,12 +202,178 @@ namespace SoulsIds
                 }
             }
 
-            if (valueSpecs != null)
+            if (doc?.DarkScript?.MetaTypes != null && valueSpecs == null)
+            {
+                valueSpecs = new List<InstructionValueSpec>();
+                Dictionary<string, List<EMEDF.DarkScriptType>> exactTypes = new Dictionary<string, List<EMEDF.DarkScriptType>>();
+                foreach (EMEDF.DarkScriptType metaType in doc.DarkScript.MetaTypes)
+                {
+                    if (metaType.Name == null && (metaType.MultiNames == null || metaType.MultiNames.Count == 0))
+                    {
+                        throw new Exception($"EMEDF validation failure: Meta type defined without applicable arg name");
+                    }
+                    string name = metaType.Name ?? metaType.MultiNames[0];
+                    if (!exactTypes.TryGetValue(name, out List<EMEDF.DarkScriptType> types))
+                    {
+                        exactTypes[name] = types = new List<EMEDF.DarkScriptType>();
+                    }
+                    types.Add(metaType);
+                }
+                Dictionary<string, string> aliasNames = new();
+                if (doc.DarkScript.MetaAliases != null)
+                {
+                    foreach (KeyValuePair<string, List<string>> entry in doc.DarkScript.MetaAliases)
+                    {
+                        foreach (string name in entry.Value)
+                        {
+                            exactTypes[name] = exactTypes[entry.Key];
+                            aliasNames[name] = entry.Key;
+                        }
+                    }
+                }
+                foreach (EMEDF.ClassDoc bank in doc.Classes)
+                {
+                    string bankStr = bank.Index.ToString();
+                    foreach (EMEDF.InstrDoc instr in bank.Instructions)
+                    {
+                        string cmdStr = FormatInstructionID(bank.Index, instr.Index);
+                        foreach (EMEDF.ArgDoc arg in instr.Arguments)
+                        {
+                            if (arg.MetaType != null)
+                            {
+                                continue;
+                            }
+                            if (!exactTypes.TryGetValue(arg.Name, out List<EMEDF.DarkScriptType> types))
+                            {
+                                continue;
+                            }
+                            EMEDF.DarkScriptType applicable = null;
+                            foreach (EMEDF.DarkScriptType cand in types)
+                            {
+                                if (cand.Cmds == null || cand.Cmds.Contains(bankStr) || cand.Cmds.Contains(cmdStr))
+                                {
+                                    applicable = cand;
+                                }
+                            }
+                            if (applicable == null)
+                            {
+                                continue;
+                            }
+                            if (applicable.MultiNames == null)
+                            {
+                                arg.MetaType = applicable;
+                            }
+                            else
+                            {
+                                foreach (string argName in applicable.MultiNames)
+                                {
+                                    EMEDF.ArgDoc multiArg = instr.Arguments
+                                        .Where(a => a.Name == argName || aliasNames.TryGetValue(a.Name, out string alias) && alias == argName)
+                                        .FirstOrDefault();
+                                    if (multiArg == null)
+                                    {
+                                        break;
+                                    }
+                                    else
+                                    {
+                                        multiArg.MetaType = applicable;
+                                    }
+                                }
+                            }
+                        }
+                        // Another pass for supported data types
+                        InstructionValueSpec spec = null;
+                        foreach (EMEDF.ArgDoc arg in instr.Arguments)
+                        {
+                            EventValueType valueType;
+                            if (arg.MetaType == null)
+                            {
+                                // TODO: This doesn't have a type yet
+                                if (arg.Name == "Animation ID")
+                                {
+                                    valueType = EventValueType.Animation;
+                                }
+                                else
+                                {
+                                    continue;
+                                }
+                            }
+                            else
+                            {
+                                EMEDF.DarkScriptType metaType = arg.MetaType;
+                                if (metaType.DataType == "entity")
+                                {
+                                    if (!aliasNames.TryGetValue(arg.Name, out string argName))
+                                    {
+                                        argName = arg.Name;
+                                    }
+                                    if (metaType.Name != null || (metaType.MultiNames != null && argName == metaType.MultiNames.Last()))
+                                    {
+                                        valueType = EventValueType.Entity;
+                                    }
+                                    else
+                                    {
+                                        continue;
+                                    }
+                                }
+                                else if (metaType.DataType == "eventflag")
+                                {
+                                    valueType = EventValueType.Flag;
+                                }
+                                else if (metaType.DataType == "param")
+                                {
+                                    if (metaType.Type == "SpEffectParam")
+                                    {
+                                        valueType = EventValueType.Speffect;
+                                    }
+                                    else
+                                    {
+                                        continue;
+                                    }
+                                }
+                                else if (metaType.DataType == "fmg")
+                                {
+                                    if (metaType.Type == "NpcName")
+                                    {
+                                        valueType = EventValueType.NpcName;
+                                    }
+                                    else
+                                    {
+                                        continue;
+                                    }
+                                }
+                                else if (arg.Name == "Animation ID")
+                                {
+                                    valueType = EventValueType.Animation;
+                                }
+                                // Other types: mapint, mapparts, etc. plus param/fmg cases not covered above
+                                else
+                                {
+                                    continue;
+                                }
+                            }
+                            if (spec == null)
+                            {
+                                spec = new InstructionValueSpec
+                                {
+                                    // Length and Alias are not needed here, just used for MakeLite
+                                    Bank = (int)bank.Index,
+                                    ID = (int)instr.Index,
+                                    Args = new Dictionary<int, EventValueType>(),
+                                };
+                                valueSpecs.Add(spec);
+                            }
+                            spec.Args[arg.Offset] = valueType;
+                        }
+                    }
+                }
+            }
+            if (valueSpecs != null && valueSpecs.Count > 0)
             {
                 funcValueTypes = new Dictionary<EMEDF.InstrDoc, Dictionary<int, EventValueType>>();
                 foreach (InstructionValueSpec spec in valueSpecs)
                 {
-                    if (spec.Args == null) continue;
+                    if (spec.Args == null || spec.Args.Count == 0) continue;
                     EMEDF.InstrDoc instrDoc = doc[spec.Bank][spec.ID];
                     funcValueTypes[instrDoc] = spec.Args;
                 }
@@ -230,11 +400,31 @@ namespace SoulsIds
                 if (spec.Alias == null)
                 {
                     doc.Name = $"c{spec.Bank}_{spec.ID}";
-                    doc.Arguments = Enumerable.Range(0, spec.Length / 4).Select(i => new EMEDF.ArgDoc
+                    List<EMEDF.ArgDoc> args = new List<EMEDF.ArgDoc>();
+                    int start = 0;
+                    int len = spec.Length / 4;
+                    // All <1000 commands use condition groups, and are needed for condition group rewriting
+                    if (spec.Bank < 1000 && len > 0)
                     {
-                        Name = $"unknown{i}",
-                        Type = (long)ArgType.Int32,
-                    }).ToArray();
+                        start = 1;
+                        for (int i = 0; i < 4; i++)
+                        {
+                            args.Add(new EMEDF.ArgDoc
+                            {
+                                Name = $"unknown0{i}",
+                                Type = (long)ArgType.SByte,
+                            });
+                        }
+                    }
+                    for (int i = start; i < len; i++)
+                    {
+                        args.Add(new EMEDF.ArgDoc
+                        {
+                            Name = $"unknown{i}",
+                            Type = (long)ArgType.Int32,
+                        });
+                    }
+                    doc.Arguments = args.ToArray();
                 }
                 else
                 {
@@ -269,10 +459,11 @@ namespace SoulsIds
         // Instruction metadata
         public Instr Parse(EMEVD.Instruction instr, OldParams pre = null)
         {
-            bool isInit = instr.Bank == 2000 && (instr.ID == 0 || instr.ID == 6);
             // if (onlyCmd && isInit) return null;
             // if (onlyInit && !isInit) return null;
-            EMEDF.InstrDoc instrDoc = doc[instr.Bank][instr.ID];
+            EMEDF.InstrDoc instrDoc = doc[instr.Bank]?[instr.ID];
+            // if (instrDoc == null) throw new Exception($"Unknown {FormatInstructionID(instr.Bank, instr.ID)}");
+            bool isInit = instr.Bank == 2000 && (instr.ID == 0 || instr.ID == 6) && instrDoc != null && instrDoc.Name.StartsWith("Init");
             List<ArgType> argTypes = (isInit || instrDoc == null)
                 ? Enumerable.Repeat(ArgType.Int32, instr.ArgData.Length / 4).ToList()
                 : instrDoc.Arguments.Select(arg => arg.Type == 8 ? ArgType.UInt32 : (ArgType)arg.Type).ToList();
@@ -290,14 +481,10 @@ namespace SoulsIds
             {
                 ret.Offset = 2;
                 // Non-Elden Ring case
-                if (instr.ID == 6)
+                if (instr.ID == 6 && (instrDoc.Arguments[0].Name == "Event ID" || instrDoc.Arguments[0].Name == "eventId"))
                 {
-                    var argName = instrDoc.Arguments[0].Name;
-                    // The raw EMEDFs list the name as "Event ID", but in darkScriptMode that gets
-                    // rewritten to eventId.
-                    if (argName == "Event ID" || argName == "eventId") ret.Offset = 1;
+                    ret.Offset = 1;
                 }
-                // ret.Callee = (int)args[instr.ID == 0 ? 1 : 0];
                 ret.Callee = (int)args[ret.Offset - 1];
             }
             if (paramAwareMode && pre != null)
@@ -317,7 +504,31 @@ namespace SoulsIds
                 int index = IndexFromByteOffset(instr, (int)p.TargetStartByte);
                 // Don't set instr[index] so Modified is not triggered
                 instr.ArgList[index] = $"X{p.SourceStartByte}_{p.ByteCount}";
+                instr.HasParams = true;
             }
+        }
+
+        public Dictionary<int, EventValueType> GetInstructionValueTypes(Instr instr)
+        {
+            if (instr.Doc != null && funcValueTypes != null && funcValueTypes.TryGetValue(instr.Doc, out Dictionary<int, EventValueType> types))
+            {
+                // Note, this dictionary is indexed by offsets
+                return types;
+            }
+            return null;
+        }
+
+        public Dictionary<int, EventValue> GetInstructionValues(Instr instr)
+        {
+            Dictionary<int, EventValueType> valTypes = GetInstructionValueTypes(instr);
+            if (valTypes == null) return null;
+            Dictionary<int, EventValue> vals = new Dictionary<int, EventValue>();
+            foreach (KeyValuePair<int, EventValueType> entry in valTypes)
+            {
+                int pos = IndexFromByteOffset(instr, entry.Key);
+                vals[pos] = new EventValue(entry.Value, instr[pos]);
+            }
+            return vals;
         }
 
         public class Instr
@@ -342,6 +553,7 @@ namespace SoulsIds
             // Dirty bit
             public bool Modified { get; private set; }
             public bool Writeable { get; internal set; }
+            internal bool HasParams { get; set; }
 
             public void Save(OldParams pre = null)
             {
@@ -373,6 +585,11 @@ namespace SoulsIds
                             }
                         }
                         pre.AddParameters(Val, ps);
+                    }
+                    else if (HasParams)
+                    {
+                        if (pre == null) throw new Exception($"Internal error: cannot repack {this} without provided param args");
+                        pre.ClearParameters(Val);
                     }
                     Val.PackArgs(packArgs);
                     Modified = false;
@@ -462,6 +679,10 @@ namespace SoulsIds
             return arg.ToString();
         }
 
+#if DEBUG
+        public EMEDF EMEDF => doc;
+#endif
+
         public int ByteOffsetFromIndex(Instr instr, int index)
         {
             // This is ambiguous here - is it in the instruction or the args - so better to disallow it
@@ -489,6 +710,21 @@ namespace SoulsIds
                 throw new Exception($"Invalid offset {offset} in {instr}\nOut of {string.Join(",", pos)}");
             }
             return paramIndex;
+        }
+
+        public (int, int) LookupArgIndex(string cmd, string argName)
+        {
+            if (!docByName.TryGetValue(cmd, out (int, int) docId)) throw new Exception($"Unrecognized command {cmd}");
+            EMEDF.InstrDoc instrDoc = doc[docId.Item1][docId.Item2];
+            for (int k = 0; k < instrDoc.Arguments.Length; k++)
+            {
+                EMEDF.ArgDoc argDoc = instrDoc.Arguments[k];
+                if (argName == (darkScriptMode ? argDoc.DisplayName : argDoc.Name))
+                {
+                    return (k, ArgLengths[argDoc.Type]);
+                }
+            }
+            throw new Exception($"Argument {argName} not found in {cmd}");
         }
 
         public static bool IsTemp(int flag)
@@ -584,6 +820,12 @@ namespace SoulsIds
                 };
             }
 
+            private static readonly List<EMEVD.Parameter> emptyParams = new List<EMEVD.Parameter>();
+            public void ClearParameters(EMEVD.Instruction instr)
+            {
+                NewInstructions[instr] = emptyParams;
+            }
+
             // Adds a never-before-seen paramterized instruction, and parameters to add later for it.
             // This should also work for existing instructions, in which case previous parmaeters will be deleted.
             public void AddParameters(EMEVD.Instruction instr, List<EMEVD.Parameter> ps)
@@ -657,13 +899,18 @@ namespace SoulsIds
 
         public class EventValue
         {
+            // ID is currently int or uint, depending on the type of entity. They should be interchangeable, however.
             public EventValue(EventValueType Type, object ID)
             {
                 this.Type = Type;
                 this.ID = ID;
             }
             public EventValueType Type { get; set; }
-            public object ID { get; set; }
+            private object ID { get; set; }
+
+            public bool IsArg() => ID is string s && s.StartsWith("X");
+
+            public string StrID => ID.ToString();
 
             public int IntID
             {
@@ -685,19 +932,65 @@ namespace SoulsIds
                 }
             }
 
+            public bool TryIntID(out int ret)
+            {
+                if (ID is int id)
+                {
+                    ret = id;
+                    return true;
+                }
+                else if (ID is uint uid)
+                {
+                    ret = (int)uid;
+                    return true;
+                }
+                else
+                {
+                    ret = 0;
+                    return false;
+                }
+            }
+
+            public bool TryUIntID(out uint ret)
+            {
+                if (ID is int id)
+                {
+                    ret = (uint)id;
+                    return true;
+                }
+                else if (ID is uint uid)
+                {
+                    ret = uid;
+                    return true;
+                }
+                else
+                {
+                    ret = 0;
+                    return false;
+                }
+            }
+
             // Convenience functions for event-editing, which are currently mostly int-based
             public static EventValue Enemy(int id) => new EventValue(EventValueType.Enemy, id);
+            public static EventValue Enemy(uint id) => new EventValue(EventValueType.Enemy, id);
             public static EventValue Asset(int id) => new EventValue(EventValueType.Asset, id);
+            public static EventValue Asset(uint id) => new EventValue(EventValueType.Asset, id);
             public static EventValue Object(int id) => new EventValue(EventValueType.Object, id);
+            public static EventValue Object(uint id) => new EventValue(EventValueType.Object, id);
             public static EventValue Flag(int id) => new EventValue(EventValueType.Flag, id);
+            public static EventValue Flag(uint id) => new EventValue(EventValueType.Flag, id);
             public static EventValue Region(int id) => new EventValue(EventValueType.Region, id);
+            public static EventValue Region(uint id) => new EventValue(EventValueType.Region, id);
             public static EventValue Generator(int id) => new EventValue(EventValueType.Generator, id);
+            public static EventValue Generator(uint id) => new EventValue(EventValueType.Generator, id);
             public static EventValue Animation(int id) => new EventValue(EventValueType.Animation, id);
             public static EventValue NpcName(int id) => new EventValue(EventValueType.NpcName, id);
             // public static EventValue Unknown(int id) => new EventValue(EventValueType.Unknown, id);
 
             public override bool Equals(object obj) => obj is EventValue o && Equals(o);
-            public bool Equals(EventValue o) => Type == o.Type && ID.Equals(o.ID);
+            // == for object is always reference-based, Equals is different for int and uint, so convert them
+            public bool Equals(EventValue o) => Type == o.Type && (TryUIntID(out uint a) && o.TryUIntID(out uint b) && a == b || ID.Equals(o.ID));
+            // HashCode for int and uint are the same
             public override int GetHashCode() => Type.GetHashCode() ^ ID.GetHashCode();
             public override string ToString() => $"{Type.ToString().ToLowerInvariant()} {ID}";
         }
@@ -797,6 +1090,362 @@ namespace SoulsIds
             // public Dictionary<string, int> SegmentChecks = new Dictionary<string, int>();
             // Segment tracking state, for edits which only apply during specific segments
             public Dictionary<string, SegmentState> SegmentStates = new Dictionary<string, SegmentState>();
+
+            // If there's an error from AdjustConditionGroups, the info, in case the overall edits fail
+            public string PreprocessError { get; set; }
+        }
+
+        // As baseline, don't try to match these, but require them to be rewritten. funcValueTypes is used for even more if present.
+        // The mapping is to the argument index of the usage.
+        private static readonly Dictionary<(int, int), int> ConditionGroupUsage = new Dictionary<(int, int), int>
+        {
+            [(0, 0)] = 2, // IfConditionGroup
+            [(1000, 0)] = 1, // WaitForConditionGroupState
+            [(1000, 1)] = 2, // SkipIfConditionGroupStateUncompiled
+            [(1000, 2)] = 2, // EndIfConditionGroupStateUncompiled
+            [(1000, 7)] = 2, // SkipIfConditionGroupStateCompiled
+            [(1000, 8)] = 2, // EndIfConditionGroupStateCompiled
+            [(1000, 101)] = 2, // GotoIfConditionGroupStateUncompiled
+            [(1000, 107)] = 2, // GotoIfConditionGroupStateCompiled
+        };
+
+        // Mattscript compilation can rewrite condition groups, so if we need to match them, check for rewrites.
+        // TODO: Split this out?
+        public Dictionary<int, int> AdjustConditionGroups(
+            EventEdits e, EMEVD.Event ev, OldParams pre, string condOrder, bool expectVanilla, int origin)
+        {
+            // Mainly NameArgEdits are relevant here.
+            // ArgEdits would be inadivsable to use for condition groups (but Sekiro might use them).
+            if (e.NameArgEdits == null) return null;
+            int parseCond(string condStr)
+            {
+                if (!int.TryParse(condStr, out int cond))
+                {
+                    if (!enumByName.TryGetValue(condStr, out cond))
+                    {
+                        throw new Exception($"Internal error: unrecognized condition group {condStr} in {origin}->{ev.ID}");
+                    }
+                }
+                return cond;
+            }
+            // First, find condition group definitions which can be used to verify condition groups
+            // (usages cannot be used for this, but they should be rewritten anyway).
+            Dictionary<(string, string), List<int>> definitions = null;
+            HashSet<int> needsRewrite = null;
+            foreach (((string cmd, string args), List<InstrEdit> edits) in e.NameArgEdits)
+            {
+                // Condition group commands have banks [0, 1000)
+                if (!docByName.TryGetValue(cmd, out (int, int) docId)) throw new Exception($"Internal error: unrecognized command in edit {cmd}({args})");
+                if (docId.Item1 >= 1000 && !ConditionGroupUsage.ContainsKey(docId)) continue;
+                EMEDF.InstrDoc instrDoc = doc[docId.Item1][docId.Item2];
+                // Non-interesting commands need to be rewritten, but ignore them for now.
+                if (ConditionGroupUsage.TryGetValue(docId, out int pos))
+                {
+                    needsRewrite ??= new HashSet<int>();
+                    needsRewrite.Add(parseCond(args.Split(',')[pos]));
+                }
+                if (docId.Item1 >= 1000 || ConditionGroupUsage.ContainsKey(docId)) continue;
+                // if (funcValueTypes != null && !funcValueTypes.ContainsKey(instrDoc)) continue;
+                string[] condParts = args.Split(new[] { ',' }, 2);
+                int cond = parseCond(condParts[0]);
+                // MAIN is fine
+                if (cond == 0) continue;
+                // if (e.AutoConds != null && e.AutoConds.Contains(cond)) continue;
+                definitions ??= new Dictionary<(string, string), List<int>>();
+                (string, string) defKey = (cmd, condParts[1]);
+                if (definitions.TryGetValue(defKey, out List<int> existConds))
+                {
+                    if (!existConds.Contains(cond))
+                    {
+                        existConds.Add(cond);
+                    }
+                }
+                else
+                {
+                    definitions[defKey] = new List<int> { cond };
+                }
+            }
+            // Segment adds are supposed to be self-contained, so they shouldn't need to be edited
+            foreach (InstrEdit edit in e.NameArgEdits.SelectMany(es => es.Value))
+            {
+                if (edit.Add != null)
+                {
+                    (string cmd, List<string> args) = ParseCommandString(edit.Add);
+                    if (!docByName.TryGetValue(cmd, out (int, int) docId)) throw new Exception($"Internal error: unrecognized command in edit {cmd}({args})");
+                    if (docId.Item1 < 1000 && int.TryParse(args[0], out int defCond) && defCond != 0)
+                    {
+                        needsRewrite ??= new HashSet<int>();
+                        needsRewrite.Add(parseCond(args[0]));
+                    }
+                    if (ConditionGroupUsage.TryGetValue(docId, out int pos))
+                    {
+                        needsRewrite ??= new HashSet<int>();
+                        needsRewrite.Add(parseCond(args[pos]));
+                    }
+                }
+            }
+            if (needsRewrite != null)
+            {
+                needsRewrite.Remove(0);
+                if (definitions != null)
+                {
+                    needsRewrite.ExceptWith(definitions.Values.SelectMany(e => e));
+                }
+                if (condOrder != null)
+                {
+                    // Not present in event, added with Add, and assumed to be in a safe range
+                    needsRewrite.ExceptWith(condOrder.Split(' ').Where(c => c.StartsWith("+")).Select(c => int.Parse(c.Substring(1))));
+                }
+                if (needsRewrite.Count > 0)
+                {
+                    // This is still looking at our own config, not merged mods yet
+                    string msg = $"Internal error: condition groups {string.Join(",", needsRewrite)} have no usable definitions in {origin}->{ev.ID}";
+                    if (expectVanilla)
+                    {
+                        // If vanilla, add some vanilla conditions which can be used to make usable definitions
+                        Console.WriteLine(msg);
+                        Console.WriteLine($"CondIdentity:");
+                        foreach (EMEVD.Instruction ins in ev.Instructions)
+                        {
+                            if (ins.Bank >= 1000) continue;
+                            Instr instr = Parse(ins, pre);
+                            if (instr.Name == "IfConditionGroup") continue;
+                            int cond = parseCond(instr[0].ToString());
+                            if (needsRewrite.Contains(cond))
+                            {
+                                Console.WriteLine($"    - {instr}");
+                            }
+                        }
+                        Console.WriteLine();
+                    }
+                    else
+                    {
+                        throw new Exception(msg);
+                    }
+                }
+            }
+            if (definitions == null)
+            {
+                return null;
+            }
+            int stopLabel = -1;
+            if (condOrder != null && condOrder.StartsWith("<"))
+            {
+                stopLabel = int.Parse(condOrder.Split(' ')[0].Substring(1));
+            }
+            List<(int, int)> rewriteInstrs = definitions.Select(e => docByName[e.Key.Item1]).Distinct().ToList();
+            // Try to narrow the remappings down
+            // For every matching condition group in actual event, try to narrow down what the config one may be.
+            // The other way around is underspecified, since the same command can be used in multiple groups.
+            Dictionary<int, List<int>> candidates = new Dictionary<int, List<int>>();
+            // Original condition for main group definition -> actual command, for matching later.
+            Dictionary<int, List<(string, string)>> mainGroups = new Dictionary<int, List<(string, string)>>();
+            foreach (EMEVD.Instruction ins in ev.Instructions)
+            {
+                if (ins.Bank == 1014 && ins.ID == stopLabel) break;
+                if (!rewriteInstrs.Contains((ins.Bank, ins.ID))) continue;
+                Instr instr = Parse(ins, pre);
+                List<string> strArgs = instr.ArgList.Select((a, i) => instr.FormatArg(a, i)).ToList();
+                // It is potentially valid for a single-cond group definition to be collapsed into a MAIN usage, so don't skip if 0
+                int actual = parseCond(strArgs[0]);
+                string rest = string.Join(",", strArgs.Skip(1));
+                (string, string) key = (instr.Name, rest);
+                if (definitions.TryGetValue(key, out List<int> prior))
+                {
+                    if (candidates.TryGetValue(actual, out List<int> matching))
+                    {
+                        if (actual == 0)
+                        {
+                            matching = matching.Union(prior).ToList();
+                        }
+                        else
+                        {
+                            matching = matching.Intersect(prior).ToList();
+                        }
+                    }
+                    else
+                    {
+                        matching = prior;
+                    }
+                    candidates[actual] = matching;
+                    if (actual == 0)
+                    {
+                        foreach (int newDef in prior)
+                        {
+                            AddMulti(mainGroups, newDef, (instr.Name, string.Join(",", strArgs)));
+                        }
+                    }
+                    // Console.WriteLine($"In {origin}->{ev.ID}: {instr} has defs [{string.Join(",", prior)}]->usage {actual}->cands {string.Join(",", matching)})");
+                }
+            }
+            string desc() => string.Join("; ", candidates.Select(e => $"[{string.Join(",", e.Value)}]->{e.Key}"));
+            if (expectVanilla)
+            {
+                List<int> mismatch = candidates.Where(e => !e.Value.Contains(e.Key)).Select(e => e.Key).ToList();
+                if (mismatch.Any())
+                {
+                    // If it's missing, add a usage to CondIdentity to indicate that both are options for the condition group
+                    Console.WriteLine($"Non-matching vanilla condition groups in {origin}->{ev.ID} for {string.Join(",", mismatch)}: config->actual mapping {desc()}");
+                    // return null;
+                }
+            }
+            // If vanilla configuration is possible, permit that
+            if (candidates.All(e => e.Value.Contains(e.Key)))
+            {
+                return null;
+            }
+            // Narrow down definitive mappings
+            // Possible actual -> config mapping
+            Dictionary<int, List<int>> reduced = candidates.ToDictionary(e => e.Key, e => e.Value.ToList());
+            // Final config -> actual mapping
+            Dictionary<int, int> newConds = new Dictionary<int, int>();
+            foreach (int actualCond in candidates.Keys)
+            {
+                if (actualCond != 0 && reduced[actualCond].Count == 1)
+                {
+                    int configCond = reduced[actualCond][0];
+                    if (Math.Sign(actualCond) * Math.Sign(configCond) == -1) continue;
+                    newConds[configCond] = actualCond;
+                    reduced.Remove(actualCond);
+                    foreach (KeyValuePair<int, List<int>> entry in reduced)
+                    {
+                        entry.Value.RemoveAll(c => c == configCond);
+                    }
+                }
+            }
+            // Assign unique MAIN conds
+            if (reduced.TryGetValue(0, out List<int> configToMain))
+            {
+                foreach (int configCond in configToMain)
+                {
+                    newConds[configCond] = 0;
+                }
+                reduced.Remove(0);
+            }
+            if (reduced.Count > 0)
+            {
+                List<int> actualConds = reduced.Keys.ToList();
+                List<int> configConds = reduced.SelectMany(e => e.Value).Distinct().ToList();
+                if (actualConds.Count == configConds.Count && condOrder != null)
+                {
+                    List<int> order = condOrder.Split(' ').Select(c => int.TryParse(c, out int i) ? i : 0).Where(i => i != 0).ToList();
+                    if (configConds.All(c => order.Contains(c)))
+                    {
+                        foreach (bool positive in new[] { true, false })
+                        {
+                            // In this case, assume Mattscript ordering
+                            List<int> configSubconds = configConds.Where(c => c > 0 == positive).OrderBy(c => order.IndexOf(c)).ToList();
+                            List<int> actualSubconds = actualConds.Where(c => c > 0 == positive).OrderBy(c => Math.Abs(c)).ToList();
+                            // if (origin == 31212810) Console.WriteLine($"Mapping config {string.Join(",", configSubconds)} -> {string.Join(",", actualSubconds)}");
+                            for (int i = 0; i < configSubconds.Count; i++)
+                            {
+                                reduced.Remove(actualSubconds[i]);
+                                newConds[configSubconds[i]] = actualSubconds[i];
+                            }
+                        }
+                    }
+                }
+                if (reduced.Count > 0)
+                {
+                    // If this error happens, add a CondOrder that includes all of the config condition groups.
+                    e.PreprocessError = $"Ambiguous condition groups in {origin}: couldn't map config groups->actual groups {desc()} {condOrder}";
+                    return null;
+                }
+            }
+            // Edit all edits now
+            // Console.WriteLine($"for {origin}: {string.Join(" ", newConds)}. {desc()}");
+            bool rewriteCommand(string cmd, string args, out string newCmd, out string newArgs)
+            {
+                newCmd = cmd;
+                newArgs = null;
+                // Similar to first loop
+                if (!docByName.TryGetValue(cmd, out (int, int) docId)) throw new Exception($"Unrecognized command {cmd}");
+                if (docId.Item1 >= 1000 && !ConditionGroupUsage.ContainsKey(docId)) return false;
+                if (needsRewrite == null) needsRewrite = new HashSet<int>();
+                EMEDF.InstrDoc instrDoc = doc[docId.Item1][docId.Item2];
+                string[] argList = args.Split(',');
+                // NameArgEdits format is already compact and standard
+                bool changed = false;
+                if (docId.Item1 < 1000)
+                {
+                    int cond = parseCond(argList[0]);
+                    if (newConds.TryGetValue(cond, out int newCond) && cond != newCond)
+                    {
+                        argList[0] = instrDoc.Arguments[0].GetDisplayValue(newCond).ToString();
+                        changed = true;
+                    }
+                }
+                if (ConditionGroupUsage.TryGetValue(docId, out int pos))
+                {
+                    int cond = parseCond(argList[pos]);
+                    if (newConds.TryGetValue(cond, out int newCond) && cond != newCond)
+                    {
+                        if (newCond == 0)
+                        {
+                            // IfConditionGroup(MAIN, PASS, <other>) will be replaced with <other> -> MAIN in a different command
+                            // Just another fun mattscriptism
+                            if (cmd == "IfConditionGroup"
+                                && parseCond(argList[2]) is int otherCond
+                                && newConds.TryGetValue(otherCond, out int otherNewCond)
+                                && otherNewCond == 0
+                                && mainGroups.TryGetValue(otherCond, out List<(string, string)> mainKeys)
+                                && mainKeys.Count == 1)
+                            {
+                                newCmd = mainKeys[0].Item1;
+                                argList = mainKeys[0].Item2.Split(',');
+                                changed = true;
+                            }
+                            if (!changed)
+                            {
+                                // Don't return here as newEdits are not yet processed
+                                e.PreprocessError = $"Can't rewrite condition groups for {cmd}({string.Join(", ", argList)}) from event {origin}";
+                            }
+                        }
+                        else
+                        {
+                            argList[pos] = instrDoc.Arguments[pos].GetDisplayValue(newCond).ToString();
+                            changed = true;
+                        }
+                    }
+                }
+                if (!changed) return false;
+                newArgs = string.Join(",", argList);
+                return true;
+            }
+            Dictionary<(string, string), List<InstrEdit>> newEdits = new Dictionary<(string, string), List<InstrEdit>>();
+            foreach ((string, string) key in e.NameArgEdits.Keys.ToList())
+            {
+                (string cmd, string args) = key;
+                List<InstrEdit> edits = e.NameArgEdits[key];
+                string searchInfo = null;
+                if (rewriteCommand(cmd, args, out string newCmd, out string newArgs))
+                {
+                    newEdits[(newCmd, newArgs)] = edits;
+                    e.NameArgEdits.Remove(key);
+                    searchInfo = $"{cmd}({args}) -> {(cmd != newCmd ? newCmd : "")}({newArgs})";
+                }
+                // Console.WriteLine($"{origin} changed {cmd}({args} -> {newArgs}) with {string.Join(",", newConds.Select(n => $"{n.Key}->{n.Value}"))}");
+                foreach (InstrEdit edit in edits)
+                {
+                    if (searchInfo != null)
+                    {
+                        edit.SearchInfo = searchInfo;
+                    }
+                    if (edit.Add != null)
+                    {
+                        (string addCmd, List<string> addArgList) = ParseCommandString(edit.Add);
+                        string addArgs = string.Join(",", addArgList);
+                        if (!rewriteCommand(addCmd, addArgs, out string newAddCmd, out string newAddArgs)) continue;
+                        // Console.WriteLine($"  sub {edit.Add} -> {newAddCmd}({newAddArgs})");
+                        edit.Add = $"{newAddCmd}({newAddArgs})";
+                    }
+                }
+            }
+            foreach (KeyValuePair<(string, string), List<InstrEdit>> entry in newEdits)
+            {
+                e.NameArgEdits[entry.Key] = entry.Value;
+            }
+            return newConds;
         }
 
         // Returns all applicable edits
@@ -960,10 +1609,6 @@ namespace SoulsIds
 
         public void AddEdit(EventEdits e, string toFind, InstrEdit edit)
         {
-            if (edit.Type == EditType.None)
-            {
-                throw new Exception($"Invalid InstrEdit {edit}");
-            }
             if (edit.Segment != null && !e.SegmentStates.ContainsKey(edit.Segment))
             {
                 throw new Exception($"Internal error: Segment {edit.Segment} not found in [{string.Join(", ", e.SegmentStates.Keys)}]");
@@ -1044,7 +1689,7 @@ namespace SoulsIds
         public enum EditType
         {
             // Various edit types. These are applied in enum order for a given instruction.
-            // Should not be used
+            // Noop, only used for condition group rewriting at present
             None,
             // Ends matching for segment-based removals
             EndSegment,
@@ -1078,11 +1723,10 @@ namespace SoulsIds
             // A segment which must already be active for this one to activate,
             // because of course there are duplicate labels/gotos/main conditions etc.
             public string PreSegment { get; set; }
-            // The instruction to add, for AddAfter/AddBefore/SegmentAdd. TODO could also do Replace I guess?
-            // The main challenge here is that addition is done in a later pass, vs replace is in-place.
-            public EMEVD.Instruction Add { get; set; }
-            // Parameters for the new instruction. InstructionIndex is filled in by OldParams during postprocessing
-            public List<EMEVD.Parameter> AddParams { get; set; }
+            // The instruction to add, for AddAfter/AddBefore/SegmentAdd
+            // Replace may be possible, but the main challenge is that add is done in a later pass, vs replace is to an individual instruction
+            // (maybe could work if OldParams are mandated)?
+            public string Add { get; set; }
             // If an instruction argument edit, the args to edit (index -> value)
             public Dictionary<int, string> PosEdit { get; set; }
             // If an instruction value edit, the values to replace (value -> value)
@@ -1095,8 +1739,7 @@ namespace SoulsIds
             public override string ToString() => $"{SearchInfo} [{Type}]"
                 + (Optional ? "[Optional]" : "")
                 + (ValueType == EventValueType.All ? "" : $"[ValueType:{ValueType}]")
-                + (Add == null ? "" : $"[Add:{Add.Bank}_{Add.ID}]")
-                + (AddParams == null ? "" : $"[Params:{AddParams.Count}]")
+                + (Add == null ? "" : $"[Add:{Add}]")
                 + (PosEdit == null ? "" : $"[Set:{string.Join(",", PosEdit)}]")
                 + (ValEdit == null ? "" : $"[Replace:{string.Join(", ", ValEdit)}]");
         }
@@ -1112,55 +1755,128 @@ namespace SoulsIds
                 instr.Save(pre);
                 ev.Instructions[j] = instr.Val;
             }
-            ApplyAdds(edits, ev);
+            ApplyAdds(edits, ev, pre);
             pre.Postprocess();
+            if (edits.PendingEdits.Count != 0)
+            {
+                throw new Exception($"{ev.ID} has unapplied edits: {string.Join("; ", edits.PendingEdits)}");
+            }
         }
 
         public void ApplyAdds(EventEdits edits, EMEVD.Event e, OldParams oldParams = null)
         {
-            // Add all commands in reverse order, to preserve indices
-            foreach (KeyValuePair<int, List<InstrEdit>> lineEdit in edits.PendingAdds.OrderByDescending(item => item.Key))
+            if (edits.PendingAdds.Count == 0)
             {
-                if (lineEdit.Key == -1)
+                return;
+            }
+            EMEVD.Instruction parseAddCmd(string add)
+            {
+                (EMEVD.Instruction instr, List<EMEVD.Parameter> ps) = ParseAddOptArg(add);
+                if (ps != null)
                 {
-                    // At the end. This is not being inserted repeatedly at an index, so re-reverse the order back to normal
-                    foreach (InstrEdit addEdit in lineEdit.Value)
+                    if (oldParams == null) throw new ArgumentException($"Can't add instruction with parameters if old params cannot be added in {edits}");
+                    oldParams.AddParameters(instr, ps);
+                }
+                return instr;
+            }
+            // Add all commands in reverse order, to preserve indices
+            // When rewriting skips, have to look at all commands. Only supported for darkScriptMode
+            if (skipAwareMode)
+            {
+                List<int> addedLines = new List<int>();
+                for (int j = e.Instructions.Count - 1; j >= 0; j--)
+                {
+                    // Console.WriteLine($"Have {e.ID} {e.Instructions.Count} instructions, got {e.Instructions[j]} {j}");
+                    // TODO: Figure out a better command to use in DS1
+                    Instr instr = e.Instructions[j].Bank == 1014 ? null : Parse(e.Instructions[j], oldParams);
+                    int added = 0;
+                    if (edits.PendingAdds.TryGetValue(j, out List<InstrEdit> lineEdit))
                     {
-                        e.Instructions.Add(addEdit.Add);
-                        if (addEdit.AddParams != null)
+                        foreach (InstrEdit addEdit in Enumerable.Reverse(lineEdit))
                         {
-                            if (oldParams == null) throw new ArgumentException($"Can't add instruction with parameters if old params cannot be added in {edits}");
-                            oldParams.AddParameters(addEdit.Add, addEdit.AddParams);
+                            if (addEdit.Add != null && addEdit.Type == EditType.AddAfter)
+                            {
+                                EMEVD.Instruction newInstr = parseAddCmd(addEdit.Add);
+                                e.Instructions.Insert(j + 1, newInstr);
+                                edits.PendingEdits.Remove(addEdit);
+                                added++;
+                            }
                         }
+                    }
+                    if (instr?.Name != null && (instr.Name.StartsWith("SkipIf") || instr.Name == "SkipUnconditionally"))
+                    {
+                        int skip = (byte)instr[0];
+                        // Look at last n "original" instructions to see how many were duplicated, including after this command
+                        int skipExtra = added + Enumerable.Reverse(addedLines).Take(skip).Sum();
+                        if (skipExtra > 0)
+                        {
+                            instr[0] = (byte)(skip + skipExtra);
+                            // Make sure to transfer existing parameters
+                            List<EMEVD.Parameter> ps = oldParams?.GetInstructionParams(e.Instructions[j]);
+                            instr.Save(oldParams);
+                            e.Instructions[j] = instr.Val;
+                            oldParams?.AddParameters(instr.Val, ps);
+                            // Console.WriteLine(instr.ToString());
+                        }
+                    }
+                    if (lineEdit != null)
+                    {
+                        foreach (InstrEdit addEdit in Enumerable.Reverse(lineEdit))
+                        {
+                            if (addEdit.Add != null && addEdit.Type != EditType.AddAfter)
+                            {
+                                EMEVD.Instruction newInstr = parseAddCmd(addEdit.Add);
+                                e.Instructions.Insert(j, newInstr);
+                                edits.PendingEdits.Remove(addEdit);
+                                added++;
+                            }
+                        }
+                    }
+                    addedLines.Add(added);
+                }
+                if (edits.PendingAdds.TryGetValue(-1, out List<InstrEdit> lastEdit))
+                {
+                    foreach (InstrEdit addEdit in lastEdit)
+                    {
+                        EMEVD.Instruction instr = parseAddCmd(addEdit.Add);
+                        e.Instructions.Add(instr);
                         edits.PendingEdits.Remove(addEdit);
                     }
-                    continue;
                 }
-                // Repeatedly inserting at the same index will produce a reverse order from the list
-                foreach (InstrEdit addEdit in Enumerable.Reverse(lineEdit.Value))
+            }
+            else
+            {
+                foreach (KeyValuePair<int, List<InstrEdit>> lineEdit in edits.PendingAdds.OrderByDescending(item => item.Key))
                 {
-                    if (addEdit.Add != null && addEdit.Type == EditType.AddAfter)
+                    if (lineEdit.Key == -1)
                     {
-                        e.Instructions.Insert(lineEdit.Key + 1, addEdit.Add);
-                        if (addEdit.AddParams != null)
+                        // At the end. This is not being inserted repeatedly at an index, so re-reverse the order back to normal
+                        foreach (InstrEdit addEdit in lineEdit.Value)
                         {
-                            if (oldParams == null) throw new ArgumentException($"Can't add instruction with parameters if old params cannot be added in {edits}");
-                            oldParams.AddParameters(addEdit.Add, addEdit.AddParams);
+                            EMEVD.Instruction instr = parseAddCmd(addEdit.Add);
+                            e.Instructions.Add(instr);
+                            edits.PendingEdits.Remove(addEdit);
                         }
-                        edits.PendingEdits.Remove(addEdit);
+                        continue;
                     }
-                }
-                foreach (InstrEdit addEdit in Enumerable.Reverse(lineEdit.Value))
-                {
-                    if (addEdit.Add != null && addEdit.Type != EditType.AddAfter)
+                    // Repeatedly inserting at the same index will produce a reverse order from the list
+                    foreach (InstrEdit addEdit in Enumerable.Reverse(lineEdit.Value))
                     {
-                        e.Instructions.Insert(lineEdit.Key, addEdit.Add);
-                        if (addEdit.AddParams != null)
+                        if (addEdit.Add != null && addEdit.Type == EditType.AddAfter)
                         {
-                            if (oldParams == null) throw new ArgumentException($"Can't add instruction with parameters if old params cannot be added in {edits}");
-                            oldParams.AddParameters(addEdit.Add, addEdit.AddParams);
+                            EMEVD.Instruction instr = parseAddCmd(addEdit.Add);
+                            e.Instructions.Insert(lineEdit.Key + 1, instr);
+                            edits.PendingEdits.Remove(addEdit);
                         }
-                        edits.PendingEdits.Remove(addEdit);
+                    }
+                    foreach (InstrEdit addEdit in Enumerable.Reverse(lineEdit.Value))
+                    {
+                        if (addEdit.Add != null && addEdit.Type != EditType.AddAfter)
+                        {
+                            EMEVD.Instruction instr = parseAddCmd(addEdit.Add);
+                            e.Instructions.Insert(lineEdit.Key, instr);
+                            edits.PendingEdits.Remove(addEdit);
+                        }
                     }
                 }
             }
@@ -1214,6 +1930,19 @@ namespace SoulsIds
             AddEdit(edits, name, checkEdit);
         }
 
+        public void IdentityMacro(EventEdits edits, string cmd)
+        {
+            InstrEdit checkEdit = new InstrEdit
+            {
+                SearchInfo = cmd,
+                Type = EditType.None,
+                Optional = true,
+            };
+            AddEdit(edits, cmd, checkEdit);
+        }
+
+        public void AddMacro(EventEdits edits, EventAddCommand add) => AddMacro(edits, new List<EventAddCommand> { add });
+
         public void AddMacro(EventEdits edits, List<EventAddCommand> adds)
         {
             foreach (EventAddCommand add in adds)
@@ -1254,22 +1983,13 @@ namespace SoulsIds
             EventEdits edits, EditType editType, string add,
             string toFind = null, bool applyOnce = false, EventValueType type = EventValueType.All)
         {
-            EMEVD.Instruction instr;
-            List<EMEVD.Parameter> ps = null;
-            if (add.Contains("X"))
-            {
-                (instr, ps) = ParseAddArg(add, 0);
-                if (ps.Count == 0) ps = null;
-            }
-            else
-            {
-                instr = ParseAdd(add);
-            }
+#if DEBUG
+            ParseAddOptArg(add);
+#endif
             InstrEdit edit = new InstrEdit
             {
                 SearchInfo = toFind,
-                Add = instr,
-                AddParams = ps,
+                Add = add,
                 Type = editType,
                 ValueType = type,
                 ApplyOnce = applyOnce,
@@ -1289,7 +2009,7 @@ namespace SoulsIds
             }
         }
 
-        public void RemoveMacro(EventEdits edits, string toFind, bool applyOnce = false, EventValueType type = EventValueType.All)
+        public void RemoveMacro(EventEdits edits, string toFind, bool applyOnce = false, EventValueType type = EventValueType.All, bool optional = false)
         {
             AddEdit(edits, toFind, new InstrEdit
             {
@@ -1297,6 +2017,7 @@ namespace SoulsIds
                 Type = EditType.Remove,
                 ValueType = type,
                 ApplyOnce = applyOnce,
+                Optional = optional,
             });
         }
 
@@ -1369,7 +2090,7 @@ namespace SoulsIds
         {
             // Assuming the args are compatible. Use string comparison for this, but it's intended for int types
             string argStr = arg.ToString();
-            return changes.Where(e => e.Key.ID.ToString() == argStr).Select(e => e.Value);
+            return changes.Where(e => e.Key.StrID == argStr).Select(e => e.Value);
         }
 
         public void RewriteInitInts(
@@ -1440,7 +2161,7 @@ namespace SoulsIds
                 {
                     if (IsArgCompatible(addDoc, i, value.Type))
                     {
-                        addArgs[i] = value.ID.ToString();
+                        addArgs[i] = value.StrID;
                         break;
                     }
                 }
@@ -1475,19 +2196,39 @@ namespace SoulsIds
         }
 
         private static readonly Regex CommentRe = new Regex(@"//.*");
-        public List<string> Decomment(List<string> cmds)
+        // Non-static variant probably shouldn't be used
+        public List<string> Decomment(List<string> cmds) => DecommentCmds(cmds);
+        public static string DecommentCmd(string cmd)
+        {
+            if (cmd == null) return null;
+            cmd = CommentRe.Replace(cmd, "").Trim();
+            return string.IsNullOrWhiteSpace(cmd) ? null : cmd;
+        }
+        public static List<string> DecommentCmds(List<string> cmds)
         {
             if (cmds == null) return null;
             return cmds
-                .Select(c => CommentRe.Replace(c, "").Trim())
-                .Where(c => !string.IsNullOrWhiteSpace(c))
+                .Select(DecommentCmd)
+                .Where(c => c != null)
                 .ToList();
         }
 
-        public bool TryGetInstructionId(string cmd, out (int, int) id)
+        public static string DehighlightCmd(string cmd)
+        {
+            if (cmd == null) return null;
+            cmd = cmd.Replace("+ ", "").Replace("*", "").Trim();
+            return string.IsNullOrWhiteSpace(cmd) ? null : cmd;
+        }
+
+        public bool TryGetInstructionID(string cmd, out (int, int) id)
         {
             // Hide this dictionary internally still for now
             return docByName.TryGetValue(cmd, out id);
+        }
+
+        private static string FormatInstructionID(long bank, long index)
+        {
+            return $"{bank}[{index.ToString().PadLeft(2, '0')}]";
         }
 
         // Parse a command so it can be added. Does not support parameters.
@@ -1547,6 +2288,58 @@ namespace SoulsIds
             return (new EMEVD.Instruction(docId.Item1, docId.Item2, args), ps);
         }
 
+        public Instr ParseAddInstr(string add)
+        {
+            // This is duplicated from other command, but this one also does fancier parsing, so whatever, just keep them in sync.
+            (string cmd, List<string> addArgs) = ParseCommandString(add);
+            if (!docByName.TryGetValue(cmd, out (int, int) docId)) throw new Exception($"Unrecognized command '{cmd}' in {add}");
+            EMEDF.InstrDoc addDoc = doc[docId.Item1][docId.Item2];
+            // Inits not supported
+            List<ArgType> argTypes = addDoc.Arguments.Select(arg => arg.Type == 8 ? ArgType.UInt32 : (ArgType)arg.Type).ToList();
+            if (addArgs.Count != argTypes.Count) throw new Exception($"Expected {argTypes.Count} arguments for {cmd}, given {addArgs.Count} in {add}");
+            // Set Val, Doc, Types, ArgList, HasParams, Modified
+            Instr instr = new Instr()
+            {
+                Val = new EMEVD.Instruction(docId.Item1, docId.Item2),
+                Doc = addDoc,
+                Types = argTypes,
+                ArgList = new(),
+                Writeable = true,
+            };
+            List<object> args = new List<object>();
+            for (int i = 0; i < addArgs.Count; i++)
+            {
+                string arg = addArgs[i];
+                if (arg.StartsWith("X"))
+                {
+                    args.Add(arg);
+                }
+                else
+                {
+                    args.Add(ParseArgWithEnum(arg, argTypes[i]));
+                }
+            }
+            instr.AddArgs(args);
+            return instr;
+        }
+
+        // Hybrid used internally, which can handle null or not
+        private (EMEVD.Instruction, List<EMEVD.Parameter>) ParseAddOptArg(string add)
+        {
+            EMEVD.Instruction instr;
+            List<EMEVD.Parameter> ps = null;
+            if (add.Contains("X"))
+            {
+                (instr, ps) = ParseAddArg(add, 0);
+                if (ps.Count == 0) ps = null;
+            }
+            else
+            {
+                instr = ParseAdd(add);
+            }
+            return (instr, ps);
+        }
+
         // Condition rewriting
         public List<int> FindCond(EMEVD.Event e, string req, OldParams pre = null)
         {
@@ -1574,7 +2367,7 @@ namespace SoulsIds
                     return cond;
                 }
             }
-            throw new Exception($"Couldn't find ending condition '{req}', group {isGroup}, in event {e.ID}");
+            throw new Exception($"Couldn't find required condition {req} in event {e.ID} (may be due to merged mod)");
         }
 
         public List<EMEVD.Instruction> RewriteCondGroup(
@@ -1584,7 +2377,7 @@ namespace SoulsIds
             sbyte sourceCond = 0;
             return after.Select(afterInstr =>
             {
-                Instr instr = Parse(CopyInstruction(afterInstr));
+                Instr instr = Parse(CopyInstruction(afterInstr), pre);
                 // IfConditionGroup
                 if (instr.Val.ID == 0 && instr.Val.Bank == 0)
                 {
@@ -1747,6 +2540,7 @@ namespace SoulsIds
 
         public class EventAny<T, D> where D : InstructionAny<T>
         {
+            public string File { get; set; }
             public int Event { get; set; }
             public bool Highlight { get; set; }
             public bool HighlightInstr { get; set; }
@@ -1760,12 +2554,15 @@ namespace SoulsIds
 
         public class InstructionAny<T>
         {
+            public string File { get; set; }
             public int Event { get; set; }
+            public int Flag { get; set; }
             public string Name { get; set; }
             public Instr Val { get; set; }
             public List<string> Args = new List<string>();
             public HashSet<int> HighlightArgs = new HashSet<int>();
             public List<T> IDs = new List<T>();
+            public List<(int, T)> CallIDs { get; set; }
             public string Space = "";
             // Deprecated
             public InstructionDebug Caller { get; set; }
@@ -1778,9 +2575,6 @@ namespace SoulsIds
             public override string ToString() => Caller == null ? $"[Event {Event}] {CallString()}" : $"{Caller.CallString()} - {CallString()}";
         }
 
-        public class EventDebug : EventAny<int, InstructionDebug> { }
-        public class InstructionDebug : InstructionAny<int> { }
-
         public SortedDictionary<EventKey, E> GetCommandHighlightedEvents<E, I, T>(
             Dictionary<string, EMEVD> emevds,
             // Given a non-init instruction, return instruction arg index + ids associated with it
@@ -1790,7 +2584,9 @@ namespace SoulsIds
             // Whether to highlight a returned value. At least one per event is needed to display it in the config output.
             Predicate<T> highlightValue,
             // Whether to always highlight a certain instruction, for the purpose of custom investigations
-            Predicate<Instr> alwaysHighlight = null)
+            Predicate<Instr> alwaysHighlight = null,
+            // Whether to process non-constructor inits as regular commands
+            bool nonConstructorInitCommands = false)
             where I : InstructionAny<T>, new()
             where E : EventAny<T, I>, new()
         {
@@ -1808,13 +2604,13 @@ namespace SoulsIds
                 foreach (EMEVD.Event e in entry.Value.Events)
                 {
                     EventKey key = new EventKey((int)e.ID, entry.Key);
-                    E eventInfo = new E { Event = (int)e.ID, UsesParameters = e.Parameters.Count > 0 };
+                    E eventInfo = new E { File = entry.Key, Event = (int)e.ID, UsesParameters = e.Parameters.Count > 0 };
                     eventInfos[key] = eventInfo;
                     for (int i = 0; i < e.Instructions.Count; i++)
                     {
                         // TODO: Can paramAwareMode be used to simplify this?
                         Instr instr = Parse(e.Instructions[i]);
-                        if (instr.Init) continue;
+                        if (!nonConstructorInitCommands && instr.Init) continue;
                         // Process parameters first
                         List<(EventKey, int)> usedParams = new List<(EventKey, int)>();
                         foreach (EMEVD.Parameter param in e.Parameters)
@@ -1831,9 +2627,12 @@ namespace SoulsIds
                                 }
                             }
                         }
+                        // Check this while generating events
+                        if (instr.Doc == null) throw new Exception($"Missing docs for {instr}");
                         // Basic display stuff
                         I info = new I
                         {
+                            File = entry.Key,
                             Event = (int)e.ID,
                             Name = instr.Name,
                             Val = instr,
@@ -1877,10 +2676,34 @@ namespace SoulsIds
                 {
                     EventKey key = new EventKey((int)e.ID, entry.Key);
                     EventAny<T, I> eventInfo = eventInfos[key];
+                    // Basic tracking for top-level flag guarding by skips (DS1)
+                    // Semi-related, some events are not safe to add inits to the end due to EndIfs.
+                    int initFlag = 0;
+                    int skipLast = 0;
                     for (int i = 0; i < e.Instructions.Count; i++)
                     {
                         Instr instr = Parse(e.Instructions[i]);
-                        if (!instr.Init) continue;
+                        if (i > skipLast)
+                        {
+                            initFlag = 0;
+                        }
+                        if (!instr.Init)
+                        {
+                            if (initFlag == 0 && instr.Name == "SkipIfEventFlag")
+                            {
+                                initFlag = instr[3] is int id ? id : (int)(uint)instr[3];
+                                // Skip if flag off means flag must be on (positive). Skip flag on is inverted.
+                                if ((byte)instr[1] == 1) initFlag = -initFlag;
+                                skipLast = i + (byte)instr[0];
+                            }
+                            else if (initFlag != 0 && i == skipLast && instr.Name == "SkipUnconditionally")
+                            {
+                                // Inits are eligible if <= skipLast
+                                initFlag = -initFlag;
+                                skipLast = i + (byte)instr[0];
+                            }
+                            continue;
+                        }
                         string calleeMap = instr.Val.ID == 6 ? "common_func" : key.Map;
                         EventKey callee = new EventKey(instr.Callee, calleeMap);
                         if (!eventInfos.TryGetValue(callee, out E calleeInfo))
@@ -1900,8 +2723,10 @@ namespace SoulsIds
                         if (alwaysHighlight?.Invoke(instr) ?? false)
                         {
                             calleeInfo.Highlight = true;
+                            calleeInfo.HighlightInstr = true;
                         }
-                        if (initVals.Count > 0 || calleeInfo.Highlight)
+                        // Always include caller I guess, as otherwise these appear to be uninitialized
+                        // if (initVals.Count > 0 || calleeInfo.Highlight)
                         {
                             // Add the metadata, but don't highlight it unless any of them are highlightable
                             string renderCallArg(object arg, int pos)
@@ -1916,12 +2741,18 @@ namespace SoulsIds
                             }
                             I caller = new I
                             {
+                                File = entry.Key,
                                 Event = (int)e.ID,
                                 Name = instr.Name,
                                 Val = instr,
                                 Args = instr.ArgList.Select(renderCallArg).ToList(),
                                 Space = darkScriptMode ? "" : " ",
+                                CallIDs = initVals,
                             };
+                            if (initFlag != 0)
+                            {
+                                caller.Flag = initFlag;
+                            }
                             calleeInfo.Callers.Add(caller);
                             List<T> callIds = initVals.Select(v => v.Item2).ToList();
                             calleeInfo.CallerIDs.AddRange(callIds);
@@ -1966,7 +2797,10 @@ namespace SoulsIds
             return eventInfos;
         }
 
-        // TODO: We can migrate this to use the generic version, in theory
+        // Simple int-based version, when no id overlaps exist
+        public class EventDebug : EventAny<int, InstructionDebug> { }
+        public class InstructionDebug : InstructionAny<int> { }
+
         public SortedDictionary<EventKey, EventDebug> GetHighlightedEvents(
             Dictionary<string, EMEVD> emevds,
             HashSet<int> ids,
@@ -2008,6 +2842,49 @@ namespace SoulsIds
                 emevds, getInstrValues, getInitValues, highlightValue, alwaysHighlight);
         }
 
+        // Simple example of EventValue-based configs. Further EventValue classification may be possible based on map data
+        public class ValueEventDebug : EventAny<EventValue, ValueInstructionDebug> { }
+        public class ValueInstructionDebug : InstructionAny<EventValue> { }
+
+        public SortedDictionary<EventKey, ValueEventDebug> GetHighlightedValueEvents(
+            Dictionary<string, EMEVD> emevds,
+            Predicate<EventValue> highlightValue,
+            Predicate<Instr> alwaysHighlight = null)
+        {
+            List<(int, EventValue)> getInstrValues(Instr instr)
+            {
+                Dictionary<int, EventValue> values = GetInstructionValues(instr);
+                return values == null ? new () : values.Select(e => (e.Key, e.Value)).ToList();
+            }
+            List<(int, EventValue)> getInitValues(Instr instr, ValueEventDebug info)
+            {
+                List<(int, EventValue)> ret = new List<(int, EventValue)>();
+                // This solely based on which parameters are referenced in the event itself
+                List<object> args = instr.Args.Skip(instr.Offset).ToList();
+                foreach (EventValue value in info.IDs)
+                {
+                    if (value.IsArg())
+                    {
+                        // This string is added by the event highlighter, formatted like X4_4
+                        // This assumes all arguments are ints/uints
+                        if (!ParseArgSpec(value.StrID, out int argPos))
+                        {
+                            throw new Exception($"Invalid string arg {value} in initialization {instr}");
+                        }
+                        if (argPos >= args.Count) throw new Exception($"Insufficient args provided to {info.Event} from {instr}");
+                        // Only use the first such instance
+                        if (ret.Any(v => v.Item1 == argPos)) continue;
+                        object obj = args[argPos];
+                        // Is it fine to add value here directly?
+                        ret.Add((argPos, new EventValue(value.Type, obj)));
+                    }
+                }
+                return ret;
+            }
+            return GetCommandHighlightedEvents<ValueEventDebug, ValueInstructionDebug, EventValue>(
+                emevds, getInstrValues, getInitValues, highlightValue, alwaysHighlight);
+        }
+
         public List<S> CreateEventConfig<S>(
             SortedDictionary<EventKey, EventDebug> eventInfos,
             Predicate<int> eligibleFilter,
@@ -2027,7 +2904,8 @@ namespace SoulsIds
             Func<EventKey, S> createSpec,
             Func<T, string> quickId,
             HashSet<int> eventsOverride = null,
-            HashSet<T> idsOverride = null)
+            HashSet<T> idsOverride = null,
+            HashSet<int> eventsCustom = null)
             where S : AbstractEventSpec
             where I : InstructionAny<T>, new()
             where E : EventAny<T, I>, new()
@@ -2053,8 +2931,7 @@ namespace SoulsIds
                 process = process && (info.HighlightInstr || eligibleIDs.Count > 0);
                 if (eventsOverride?.Count > 0) process = eventsOverride.Contains(entry.Key.ID);
                 else if (idsOverride?.Count > 0) process = idsOverride.Intersect(info.AllIDs).Count() > 0;
-                // TODO: Add a way to just specify event ids (again?)
-                if (entry.Key.ID == 9005822) process = true;
+                if (eventsCustom != null && eventsCustom.Contains(entry.Key.ID)) process = true;
                 if (!process) continue;
 
                 S spec = createSpec(entry.Key);
@@ -2076,17 +2953,21 @@ namespace SoulsIds
                     }
                     else
                     {
+                        // TODO: Should this also check eligibleIDs? Or else why is above branch checking it?
                         spec.DebugInfo = info.IDs.Distinct().Select(id => quickId(id)).ToList();
                     }
                     spec.DebugInfo.RemoveAll(text => text == null);
                     HashSet<T> usedIds = new HashSet<T>(info.IDs);
-                    if (info.Callers.Count > 1 || info.UsesParameters)
+                    if (info.Callers.Count > 1 || info.UsesParameters || info.Callers.Any(c => c.Flag != 0))
                     {
                         List<string> initInfo = new List<string>();
                         bool first = true;
                         foreach (I caller in info.Callers)
                         {
-                            initInfo.Add(caller.CallString());
+                            string suffix = "";
+                            if (!constructorIds.Contains(caller.Event)) suffix += $" from {caller.Event}";
+                            if (caller.Flag != 0) suffix += caller.Flag > 0 ? $" if {caller.Flag}" : $" if not {-caller.Flag}";
+                            initInfo.Add(caller.CallString() + suffix);
                             foreach (T id in caller.IDs)
                             {
                                 if (usedIds.Add(id))
@@ -2164,7 +3045,52 @@ namespace SoulsIds
             "AI","HP","SE","SP","SFX","FFX","NPC"
         };
 
-        private static string TitleCaseName(string s)
+        private static string TitleCaseName(string s, bool camelCase = false)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+
+            string[] words = Regex.Replace(s, @"[^\w\s]", "").Split(' ');
+            for (int i = 0; i < words.Length; i++)
+            {
+                if (words[i].Length == 0)
+                {
+                    continue;
+                }
+                if (Acronyms.Contains(words[i].ToUpper()))
+                {
+                    words[i] = words[i].ToUpper();
+                }
+                else if (words[i] == "SpEffect")
+                {
+                    // Leave as-is
+                }
+                else
+                {
+                    char firstChar = char.ToUpper(words[i][0]);
+                    string rest = "";
+                    if (words[i].Length > 1)
+                    {
+                        rest = words[i].Substring(1).ToLower();
+                    }
+                    words[i] = firstChar + rest;
+                }
+                if (camelCase && i == 0)
+                {
+                    // Basic heuristic: keep going until we hit non-uppercase, but only within the first word
+                    int j;
+                    for (j = 0; j < words[i].Length; j++)
+                    {
+                        char ch = words[i][j];
+                        if (char.ToLower(ch) == ch) break;
+                    }
+                    words[i] = words[i].Substring(0, j).ToLower() + words[i].Substring(j);
+                }
+            }
+            string output = Regex.Replace(string.Join("", words), @"[^\w]", "");
+            return output;
+        }
+
+        private static string TitleCaseNameOld(string s)
         {
             if (string.IsNullOrEmpty(s)) return s;
 
@@ -2197,10 +3123,10 @@ namespace SoulsIds
             return output;
         }
 
-        private static string CamelCaseName(string s)
+        private static string CamelCaseNameOld(string s)
         {
             if (string.IsNullOrEmpty(s)) return s;
-            string name = TitleCaseName(s);
+            string name = TitleCaseNameOld(s);
             char firstChar = char.ToLowerInvariant(name[0]);
             if (name.Length > 1)
                 return firstChar + name.Substring(1);

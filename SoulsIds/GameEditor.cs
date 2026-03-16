@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -28,8 +29,20 @@ namespace SoulsIds
             return LoadParams($@"{Spec.GameDir}\{Spec.ParamFile}", defs);
         }
 
+        public Dictionary<string, string> LoadTentativeMapping()
+        {
+            Dictionary<string, string> tentative = new Dictionary<string, string>();
+            string tentativePath = $@"{Spec.DefDir}\TentativeParamType.csv";
+            if (File.Exists(tentativePath))
+            {
+                tentative = File.ReadAllLines(tentativePath).Skip(1).Select(l => l.Split(',')).ToDictionary(p => p[0], p => p[1]);
+            }
+            return tentative;
+        }
+
         public Dictionary<string, PARAM> LoadParams(string path, Dictionary<string, PARAMDEF> defs)
         {
+            Dictionary<string, string> tentative = LoadTentativeMapping();
             return LoadBnd(path, (data, paramPath) =>
             {
                 PARAM param;
@@ -39,17 +52,20 @@ namespace SoulsIds
                 }
                 catch (Exception e)
                 {
-                    throw new Exception($"Failed to load param {paramPath}: " + e);
+                    return null;
                 }
                 if (defs != null && defs.Count > 0)
                 {
-                    if (!param.ApplyParamdefCarefully(defs.Values))
+                    // Can also check string.IsNullOrEmpty(param.ParamType) - depends on future version weirdness
+                    tentative.TryGetValue(paramPath, out string overrideType);
+                    if (!ParamDictionary.ApplyParamdefCarefully(param, defs.Values, overrideType))
                     {
-                        // Console.WriteLine($"No applicable paramdef found for {paramPath} ({param.DetectedSize} size)");
+                        // Console.WriteLine($"No applicable paramdef found for {paramPath} ({param.DetectedSize} size, {param.ParamdefDataVersion} version)");
                     }
                 }
                 return param;
-            });
+            // Needed for DS3 to not parse MenuParam.stayparam (works for other games too?)
+            }, ".param");
         }
 
         // Load params from a combination of game dir and param file in spec.
@@ -102,9 +118,15 @@ namespace SoulsIds
         public Dictionary<T, string> LoadNames<T>(string name, Func<string, T> key, bool allowMissing = false)
         {
             if (Spec.NameDir == null) throw new Exception("Name file dir not provided");
-            Dictionary<T, string> ret = new Dictionary<T, string>();
             string path = $@"{Spec.NameDir}\{name}.txt";
             if (allowMissing && !File.Exists(path)) return new Dictionary<T, string>();
+            return LoadNamesRel(path, key);
+        }
+
+        // Load names in path related to current dir
+        public Dictionary<T, string> LoadNamesRel<T>(string path, Func<string, T> key)
+        {
+            Dictionary<T, string> ret = new Dictionary<T, string>();
             foreach (var line in File.ReadLines(path))
             {
                 if (line.StartsWith("#")) continue;
@@ -151,8 +173,14 @@ namespace SoulsIds
         public Dictionary<string, T> Load<T>(string relDir, Func<string, T> reader, string ext = "*.dcx")
         {
             if (Spec.GameDir == null) throw new Exception("Base game dir not provided");
-            Dictionary<string, T> ret = new Dictionary<string, T>();
-            foreach (string path in Directory.GetFiles($@"{Spec.GameDir}\{relDir}", ext))
+            return LoadRel($@"{Spec.GameDir}\{relDir}", reader, ext);
+        }
+
+        // Loads multiple files from dir, relative to the current directory
+        public Dictionary<string, T> LoadRel<T>(string dir, Func<string, T> reader, string ext = "*.dcx")
+        {
+            Dictionary<string, T> ret = new();
+            foreach (string path in Directory.GetFiles(dir, ext))
             {
                 string name = BaseName(path);
                 try
@@ -165,6 +193,27 @@ namespace SoulsIds
                 }
             }
             return ret;
+        }
+
+        public Dictionary<string, T> LoadParallel<T>(string relDir, Func<string, T> reader, string ext = "*.dcx")
+        {
+            if (Spec.GameDir == null) throw new Exception("Base game dir not provided");
+            ConcurrentDictionary<string, T> ret = new();
+            string[] paths = Directory.GetFiles($@"{Spec.GameDir}\{relDir}", ext);
+            Parallel.For(0, paths.Length, i =>
+            {
+                string path = paths[i];
+                string name = BaseName(path);
+                try
+                {
+                    ret[name] = reader(path);
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception($"Failed to load {path}: {ex}");
+                }
+            });
+            return ret.ToDictionary(e => e.Key, e => e.Value);
         }
 
         // Loads a bnd file from file path, relative to the current dir
@@ -195,6 +244,7 @@ namespace SoulsIds
                     // TODO: Check this is okay, rather than printing
                     throw new Exception($"Failed to load {path}: {bndName}: {ex}");
                 }
+                // Console.WriteLine($"{file.ID}: {file.Name}");
             }
             return bnds;
         }
@@ -203,8 +253,14 @@ namespace SoulsIds
         public Dictionary<string, Dictionary<string, T>> LoadBnds<T>(string relDir, Func<byte[], string, T> parser, string ext = "*bnd.dcx", string fileExt = null)
         {
             if (Spec.GameDir == null) throw new Exception("Base game dir not provided");
+            return LoadBndsRel($@"{Spec.GameDir}\{relDir}", parser, ext, fileExt);
+        }
+
+        // Loads multiple bnd files from file path, relative to current directory
+        public Dictionary<string, Dictionary<string, T>> LoadBndsRel<T>(string dir, Func<byte[], string, T> parser, string ext = "*bnd.dcx", string fileExt = null)
+        {
             Dictionary<string, Dictionary<string, T>> ret = new Dictionary<string, Dictionary<string, T>>();
-            foreach (string path in Directory.GetFiles($@"{Spec.GameDir}\{relDir}", ext))
+            foreach (string path in Directory.GetFiles(dir, ext))
             {
                 string name = BaseName(path);
                 Dictionary<string, T> bnds = LoadBnd(path, parser, fileExt);
@@ -228,10 +284,18 @@ namespace SoulsIds
                 {
                     return SFUtil.DecryptDS3Regulation(path);
                 }
-                if (Spec.Game == FromGame.ER && detectPath.EndsWith("regulation.bin"))
+                else if (Spec.Game == FromGame.ER && detectPath.EndsWith(".bin"))
                 {
                     return SFUtil.DecryptERRegulation(path);
                 }
+                //else if (Spec.Game == FromGame.AC6 && detectPath.EndsWith(".bin"))
+                //{
+                //    return SFUtil.DecryptAC6Regulation(path);
+                //}
+                //else if (Spec.Game == FromGame.NR && detectPath.EndsWith(".bin"))
+                //{
+                //    return SFUtil.DecryptNRRegulation(path);
+                //}
                 byte[] data = File.ReadAllBytes(path);
                 if (DCX.Is(data))
                 {
@@ -273,6 +337,11 @@ namespace SoulsIds
                     bnd4.Compression = dcx;
                     SFUtil.EncryptERRegulation(outPath, bnd4);
                 }
+                //else if (Spec.Game == FromGame.NR && outPath.EndsWith("regulation.bin"))
+                //{
+                //    bnd4.Compression = dcx;
+                //    SFUtil.EncryptNRRegulation(outPath, bnd4);
+                //}
                 else
                 {
                     bnd4.Write(outPath, dcx);
@@ -340,6 +409,12 @@ namespace SoulsIds
             }
         }
 
+        public FMGDictionary LoadFmgBnd(string path)
+        {
+            Dictionary<string, byte[]> fmgBytes = LoadBnd(path, (data, _) => data);
+            return new FMGDictionary { Inner = fmgBytes };
+        }
+
         // Return a path name without, for easy access within code.
         // This should be avoided when there are multiple files with the same base name.
         public static string BaseName(string path)
@@ -393,6 +468,27 @@ namespace SoulsIds
                 CopyRow(oldRow, row);
             }
             return row;
+        }
+
+        public static Dictionary<int, PARAM.Row> ParamToDictionary(PARAM p)
+        {
+            Dictionary<int, PARAM.Row> rows = new Dictionary<int, PARAM.Row>(p.Rows.Count);
+            foreach (PARAM.Row r in p.Rows)
+            {
+                // Use first row in order
+                rows.TryAdd(r.ID, r);
+            }
+            return rows;
+        }
+
+        public static Dictionary<int, T> ParamToDictionary<T>(PARAM p, Func<PARAM.Row, T> convert)
+        {
+            Dictionary<int, T> rows = new Dictionary<int, T>(p.Rows.Count);
+            foreach (PARAM.Row r in p.Rows)
+            {
+                rows.TryAdd(r.ID, convert(r));
+            }
+            return rows;
         }
     }
 }

@@ -1,6 +1,8 @@
 using Newtonsoft.Json;
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 
 namespace SoulsIds
 {
@@ -17,6 +19,9 @@ namespace SoulsIds
         [JsonProperty(PropertyName = "enums")]
         public EnumDoc[] Enums;
 
+        [JsonProperty(PropertyName = "darkscript")]
+        public DarkScriptDoc DarkScript { get; set; }
+
         public static EMEDF ReadText(string input)
         {
             return JsonConvert.DeserializeObject<EMEDF>(input);
@@ -26,6 +31,12 @@ namespace SoulsIds
         {
             string input = File.ReadAllText(path);
             return ReadText(input);
+        }
+
+        public void WriteFile(string path)
+        {
+            string output = JsonConvert.SerializeObject(this, Formatting.Indented).Replace("\r\n", "\n");
+            File.WriteAllText(path, output);
         }
 
         public class ClassDoc
@@ -83,22 +94,31 @@ namespace SoulsIds
             public string FormatString { get; set; }
 
             [JsonProperty(PropertyName = "unk1")]
-            private long UNK1 { get; set; }
+            public long UNK1 { get; set; }
 
             [JsonProperty(PropertyName = "unk2")]
-            private long UNK2 { get; set; }
+            public long UNK2 { get; set; }
 
             [JsonProperty(PropertyName = "unk3")]
-            private long UNK3 { get; set; }
+            public long UNK3 { get; set; }
 
             [JsonProperty(PropertyName = "unk4")]
-            private long UNK4 { get; set; }
+            public long UNK4 { get; set; }
 
             // Calculated values
 
+            // SoulsIds only
+            [JsonIgnore]
             public int Offset { get; set; }
 
+            [JsonIgnore]
+            public string DisplayName { get; set; }
+
+            [JsonIgnore]
             public EnumDoc EnumDoc { get; set; }
+
+            [JsonIgnore]
+            public DarkScriptType MetaType { get; set; }
 
             public object GetDisplayValue(object val) => EnumDoc == null ? val : EnumDoc.GetDisplayValue(val);
         }
@@ -112,12 +132,62 @@ namespace SoulsIds
             public Dictionary<string, string> Values { get; set; }
 
             // Calculated values
-
+            [JsonIgnore]
             public string DisplayName { get; set; }
 
+            [JsonIgnore]
             public Dictionary<string, string> DisplayValues { get; set; }
 
             public object GetDisplayValue(object val) => DisplayValues.TryGetValue(val.ToString(), out string reval) ? reval : val;
+        }
+
+        // Pared down version of DarkScript3 for metadata purposes
+        public class DarkScriptDoc
+        {
+            [JsonProperty(PropertyName = "meta_aliases", Order = 5)]
+            public Dictionary<string, List<string>> MetaAliases { get; set; }
+
+            [JsonProperty(PropertyName = "meta_types", Order = 6)]
+            public List<DarkScriptType> MetaTypes { get; set; }
+        }
+
+        public class DarkScriptType
+        {
+            // The main canonical arg name for the type
+            [JsonProperty(PropertyName = "name", Order = 1)]
+            public string Name { get; set; }
+
+            [JsonProperty(PropertyName = "multi_names", Order = 2)]
+            public List<string> MultiNames { get; set; }
+
+            [JsonProperty(PropertyName = "cmds", Order = 3)]
+            public List<string> Cmds { get; set; }
+
+            // Relevant types: entity, eventflag
+            // For full EventValueType coverage: speffect, animation. (npcname covered by FMG)
+            [JsonProperty(PropertyName = "data_type", Order = 4)]
+            public string DataType { get; set; }
+
+            [JsonProperty(PropertyName = "type", Order = 5)]
+            public string Type { get; set; }
+
+            [JsonProperty(PropertyName = "types", Order = 6)]
+            public List<string> Types { get; set; }
+
+            [JsonProperty(PropertyName = "override_enum", Order = 7)]
+            public string OverrideEnum { get; set; }
+
+            [JsonProperty(PropertyName = "override_types", Order = 8)]
+            public Dictionary<string, DarkScriptTypeOverride> OverrideTypes { get; set; }
+
+            public IEnumerable<string> AllTypes => (Type == null ? Array.Empty<string>() : new[] { Type }).Concat(Types ?? new List<string>());
+        }
+
+        public class DarkScriptTypeOverride
+        {
+            // The enum value to select a type.
+            [JsonProperty(PropertyName = "value", Order = 1)]
+            public int Value { get; set; }
         }
     }
 }

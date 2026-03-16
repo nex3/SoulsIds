@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -10,20 +10,27 @@ using static SoulsIds.GameSpec;
 
 namespace SoulsIds
 {
+    // A whole bunch of this needs to be updated from old layout files, and MSB scraping should probably be obsoleted.
     public class Scraper
     {
         public static readonly Dictionary<string, Namespace> MsgTypes = new Dictionary<string, Namespace>
         {
-            // DS3 and Sekiro
-            { "NPC\u540d", Namespace.NPC },
-            { "\u6b66\u5668\u540d", Namespace.Weapon },
-            { "\u30a2\u30a4\u30c6\u30e0\u540d", Namespace.Goods },
-            { "\u30a4\u30d9\u30f3\u30c8\u30c6\u30ad\u30b9\u30c8", Namespace.Action },
-            { "\u4f1a\u8a71", Namespace.Dialogue },
-            { "\u4f1a\u8a71_dlc1", Namespace.Dialogue },
-            { "\u4f1a\u8a71_dlc2", Namespace.Dialogue },
-            { "\u9632\u5177\u540d", Namespace.Protector },
-            { "\u30a2\u30af\u30bb\u30b5\u30ea\u540d", Namespace.Accessory },
+            // DS3, Sekiro, AC6
+            { "NPC名", Namespace.NPC },
+            { "武器名", Namespace.Weapon },
+            { "アイテム名", Namespace.Goods },
+            { "イベントテキスト", Namespace.Action },
+            { "会話", Namespace.Dialogue },
+            { "会話_dlc1", Namespace.Dialogue },
+            { "会話_dlc2", Namespace.Dialogue },
+            { "防具名", Namespace.Protector },
+            { "アクセサリ名", Namespace.Accessory },
+            // AC6
+            { "ミッション名", Namespace.Mission },
+            { "チュートリアルタイトル", Namespace.Tutorial },
+            { "ブースター名", Namespace.Booster },
+            { "FCS名", Namespace.Fcs },
+            { "ジェネレーター名", Namespace.Generator },
             // DS1
             { "Weapon_name_", Namespace.Weapon },
             { "Armor_name_", Namespace.Protector },
@@ -47,6 +54,8 @@ namespace SoulsIds
             { "EventTextForTalk", Namespace.Action },
             { "ActionButtonText", Namespace.ActionButtonText },
             { "TalkMsg", Namespace.Dialogue },
+            // NR
+            { "AntiqueName", Namespace.Antique },
         };
         public static readonly Dictionary<Namespace, string> ItemParams = new Dictionary<Namespace, string>
         {
@@ -56,50 +65,101 @@ namespace SoulsIds
             { Namespace.Goods, "EquipParamGoods" },
         };
 
-        private GameSpec spec;
-        private GameEditor editor;
+        private readonly GameSpec spec;
+        private readonly GameEditor editor;
+        private readonly string modDir;
 
         private Dictionary<string, PARAM> Params;
-        public Scraper(GameSpec spec)
+        public Scraper(GameSpec spec, string modDir = null)
         {
             this.spec = spec;
             this.editor = new GameEditor(spec);
+            this.modDir = modDir;
         }
 
         private void LoadParams()
         {
-            if (Params == null)
+            if (Params == null && spec.ParamFile != null)
             {
+                string modPath = modDir == null ? null : $@"{modDir}\{spec.ParamFile}";
                 if (spec.DefDir == null)
                 {
-                    Params = new GameEditor(spec).LoadParams(null, true);
+                    if (File.Exists(modPath))
+                    {
+                        Params = editor.LoadParams(modPath, null, true);
+                    }
+                    else
+                    {
+                        Params = editor.LoadParams(null, true);
+                    }
                 }
                 else
                 {
-                    GameEditor editor = new GameEditor(spec);
-                    Params = editor.LoadParams(editor.LoadDefs());
+                    if (File.Exists(modPath))
+                    {
+                        Params = editor.LoadParams(modPath, editor.LoadDefs());
+                    }
+                    else
+                    {
+                        Params = editor.LoadParams(editor.LoadDefs());
+                    }
                 }
             }
         }
 
         private static readonly Dictionary<FromGame, string> talkParamMsgId = new Dictionary<FromGame, string>
         {
+            [FromGame.DES] = "msgId",
+            [FromGame.DS1] = "msgId",
             [FromGame.DS1R] = "msgId",
             // Just add the male lines for the moment... they have the same talk id
             [FromGame.DS3] = "PcGenderFemale1",
             [FromGame.SDT] = "TalkParamId1",
             [FromGame.ER] = "msgId",
+            [FromGame.AC6] = "msgId",
+            [FromGame.NR] = "msgId",
         };
+
         public bool ScrapeMsgs(Universe u)
         {
             if (spec.MsgDir == null) return false;
-            foreach (KeyValuePair<string, FMG> entry in editor.LoadBnds(spec.MsgDir, (data, name) => FMG.Read(data)).SelectMany(e => e.Value)
-                .Concat(editor.Load(spec.MsgDir, name => FMG.Read(name), "*.fmg")).OrderBy(e => e.Key))
+            string glob = spec.Game == FromGame.ER ? "*_dlc02.msgbnd.dcx" : "*.msgbnd.dcx";
+            List<Dictionary<string, FMG>> fmgDicts = new();
+            foreach (string path in Directory.GetFiles($@"{spec.GameDir}\{spec.MsgDir}", glob))
             {
-                if (MsgTypes.ContainsKey(entry.Key))
+                string fmgPath = modDir == null ? null : $@"{modDir}\{spec.MsgDir}\{Path.GetFileName(path)}";
+                if (!File.Exists(fmgPath))
                 {
-                    Namespace type = MsgTypes[entry.Key];
-                    foreach (FMG.Entry name in entry.Value.Entries)
+                    fmgPath = path;
+                }
+                fmgDicts.Add(editor.LoadBnd(fmgPath, (data, name) => FMG.Read(data)));
+            }
+            {
+                Dictionary<string, FMG> loose = editor.Load(spec.MsgDir, name => FMG.Read(name), "*.fmg");
+                if (modDir != null && Directory.Exists($@"{modDir}\{spec.MsgDir}"))
+                {
+                    foreach (KeyValuePair<string, FMG> entry in editor.LoadRel($@"{modDir}\{spec.MsgDir}", name => FMG.Read(name), "*.fmg"))
+                    {
+                        if (loose.ContainsKey(entry.Key))
+                        {
+                            loose[entry.Key] = entry.Value;
+                        }
+                    }
+                }
+                fmgDicts.Add(loose);
+            }
+            Dictionary<string, FMG> allFmgs = fmgDicts
+                .SelectMany(e => e)
+                // Used for DS1. We probably shouldn't use FMG names as a key here.
+                .DistinctBy(e => e.Key)
+                .ToDictionary(e => e.Key, e => e.Value);
+            foreach (string fmgId in allFmgs.Keys)
+            {
+                if (MsgTypes.ContainsKey(fmgId))
+                {
+                    Namespace type = MsgTypes[fmgId];
+                    FMGX fmgx = spec.Game == FromGame.ER ? FMGX.DLC(allFmgs, fmgId) : new FMGX(allFmgs[fmgId]);
+                    foreach (FMG.Entry name in fmgx.Entries)
                     {
                         u.Names[Obj.Of(type, name.ID)] = name.Text;
                     }
@@ -107,6 +167,7 @@ namespace SoulsIds
             }
             if (Directory.Exists($@"{spec.GameDir}\{spec.MsgDir}\talk"))
             {
+                // DS2. TODO mod dir override if needed
                 foreach (KeyValuePair<string, FMG> entry in editor.Load(spec.MsgDir + @"\talk", name => FMG.Read(name), "*.fmg"))
                 {
                     foreach (FMG.Entry name in entry.Value.Entries)
@@ -131,14 +192,53 @@ namespace SoulsIds
                     }
                 }
             }
+            // Additional param-based messages for specific games
+            if (spec.Game == FromGame.ER || spec.Game == FromGame.NR)
+            {
+                foreach (PARAM.Row row in Params["ActionButtonParam"].Rows)
+                {
+                    Obj actionText = Obj.Of(Namespace.ActionButtonText, (int)row["textId"].Value);
+                    if (u.Names.ContainsKey(actionText))
+                    {
+                        Obj action = Obj.Of(Namespace.ActionButton, row.ID);
+                        u.Names[action] = u.Names[actionText];
+                    }
+                }
+            }
+            else if (spec.Game == FromGame.AC6)
+            {
+                foreach (PARAM.Row row in Params["FeTextEffectParam"].Rows)
+                {
+                    List<string> values = new();
+                    // TODO migrate to real paramdefs
+                    for (int i = 1; i <= 3; i++)
+                    {
+                        int textId = (int)row[$"textId{i}"].Value;
+                        if (textId > 0)
+                        {
+                            Obj action = Obj.Of(Namespace.Action, textId);
+                            if (u.Names.ContainsKey(action))
+                            {
+                                values.Add(u.Names[action]);
+                            }
+                        }
+                    }
+                    if (values.Count > 0)
+                    {
+                        u.Names[Obj.TextEffect(row.ID)] = string.Join(" - ", values);
+                    }
+                }
+            }
             return true;
         }
+
         public bool ScrapeItems(Universe u)
         {
             // We may be able to support partial ids just based on row ids, but shelve this for now
+            // This is currently only done for games which use item lots and other param-based names.
             if (spec.ParamFile == null) return false;
             LoadParams();
-            if (spec.Game == FromGame.DS2S)
+            if (spec.Game == FromGame.DS2 || spec.Game == FromGame.DS2S)
             {
                 if (!Params.ContainsKey("ItemLotParam2_Other")) return false;
                 foreach (PARAM.Row row in Params["ItemLotParam2_Other"].Rows.Concat(Params["ItemLotParam2_Chr"].Rows))
@@ -149,13 +249,13 @@ namespace SoulsIds
                     if (u.Names.ContainsKey(item) && !u.Names.ContainsKey(lot)) u.Names[lot] = u.Names[item];
                 }
             }
-            if (spec.Game == FromGame.DS1R && Params.ContainsKey("ItemLotParam"))
+            else if ((spec.Game == FromGame.DS1 || spec.Game == FromGame.DS1R) && Params.ContainsKey("ItemLotParam"))
             {
                 foreach (PARAM.Row row in Params["ItemLotParam"].Rows)
                 {
                     Obj lot = Obj.Lot((int)row.ID);
                     int eventFlag = (int)row["getItemFlagId"].Value;
-                    if (eventFlag != -1)
+                    if (eventFlag > 0)
                     {
                         u.Add(Verb.WRITES, lot, Obj.EventFlag(eventFlag));
                     }
@@ -211,8 +311,57 @@ namespace SoulsIds
                 }
                 // NPC param file is invalid for DS1R? lot should be itemLotId_1 though
             }
-            else if (spec.Game == FromGame.ER && Params.ContainsKey("ItemLotParam_map"))
+            else if ((spec.Game == FromGame.ER || spec.Game == FromGame.NR) && Params.ContainsKey("ItemLotParam_map"))
             {
+                Dictionary<int, Namespace> lotMapping;
+                Dictionary<int, Namespace> shopMapping;
+                if (spec.Game == FromGame.ER)
+                {
+                    lotMapping = new Dictionary<int, Namespace>
+                    {
+                        // The enum order is WEAPON PROTECTOR ACCESSORY GOODS (GEM ART)
+                        [1] = Namespace.Goods,
+                        [2] = Namespace.Weapon,
+                        [3] = Namespace.Protector,
+                        [4] = Namespace.Accessory,
+                        [5] = Namespace.Gem,
+                        [6] = Namespace.CustomWeapon,
+                    };
+                    shopMapping = new Dictionary<int, Namespace>
+                    {
+                        [0] = Namespace.Weapon,
+                        [1] = Namespace.Protector,
+                        [2] = Namespace.Accessory,
+                        [3] = Namespace.Goods,
+                        [4] = Namespace.Gem,
+                        [5] = Namespace.CustomWeapon,
+                    };
+                }
+                else
+                {
+                    // Slight annoying differences
+                    lotMapping = new Dictionary<int, Namespace>
+                    {
+                        [1] = Namespace.Goods,
+                        [2] = Namespace.Weapon,
+                        [3] = Namespace.Protector,
+                        [4] = Namespace.Accessory,
+                        [5] = Namespace.Antique,
+                        [6] = Namespace.CustomWeapon,
+                        [7] = Namespace.ItemTable,
+                    };
+                    shopMapping = new Dictionary<int, Namespace>
+                    {
+                        [0] = Namespace.Weapon,
+                        // Unknown (invalid ids)
+                        [1] = Namespace.Protector,
+                        [2] = Namespace.Accessory,
+                        [3] = Namespace.Goods,
+                        [4] = Namespace.Antique,
+                        [5] = Namespace.ItemTable,
+                        [6] = Namespace.CustomWeapon,
+                    };
+                }
                 foreach (string variant in new[] { "map", "enemy" })
                 {
                     foreach (PARAM.Row row in Params[$"ItemLotParam_{variant}"].Rows)
@@ -223,23 +372,13 @@ namespace SoulsIds
                         {
                             u.Add(Verb.WRITES, lot, Obj.EventFlag(eventFlag));
                         }
-                        Dictionary<int, Namespace> typeMapping = new Dictionary<int, Namespace>
-                        {
-                            // The enum order is WEAPON PROTECTOR ACCESSORY GOODS (GEM ART)
-                            [1] = Namespace.Goods,
-                            [2] = Namespace.Weapon,
-                            [3] = Namespace.Protector,
-                            [4] = Namespace.Accessory,
-                            [5] = Namespace.Gem,
-                            [6] = Namespace.Global,  // TODO: This is the own weapon
-                        };
                         for (int i = 1; i <= 8; i++)
                         {
                             int id = (int)row[$"lotItemId0{i}"].Value;
                             int type = (int)row[$"lotItemCategory0{i}"].Value;
                             if (id != 0 && type != 0)
                             {
-                                Namespace itemType = typeMapping[type];
+                                Namespace itemType = lotMapping[type];
                                 Obj item = Obj.Of(itemType, id);
                                 u.Add(Verb.PRODUCES, lot, item);
                                 if (u.Names.ContainsKey(item) && !u.Names.ContainsKey(lot))
@@ -274,10 +413,10 @@ namespace SoulsIds
 
                     int type = (byte)row["equipType"].Value;
                     int id = (int)row["equipId"].Value;
-                    // List<Obj> objs = new List<uint> { 0, 1, 2, 3, 4, 5 }.Select(t => Obj.Item(t, id)).Where(t => u.Names.ContainsKey(t) && !string.IsNullOrEmpty(u.Names[t])).ToList();
-                    // Console.WriteLine($"shop {row.ID}: for type {type}, these exist: {string.Join(", ", objs.Select(o => $"{o}={u.Names[o]}"))}");
 
-                    Obj item = Obj.Item((uint)type, id);
+                    Namespace itemType = shopMapping[type];
+                    Obj item = Obj.Of(itemType, id);
+
                     u.Add(Verb.PRODUCES, shop, item);
                     if (u.Names.ContainsKey(item))
                     {
@@ -294,22 +433,15 @@ namespace SoulsIds
                         u.Add(Verb.CONSUMES, shop, Obj.Material(material));
                     }
                 }
+                // Also other misc param-based text I suppose
                 foreach (PARAM.Row row in Params["GestureParam"].Rows)
                 {
+                    // TODO fix
                     Obj item = Obj.Of(Namespace.Goods, (int)row["itemId"].Value);
                     if (u.Names.ContainsKey(item))
                     {
                         Obj gesture = Obj.Of(Namespace.Gesture, row.ID);
                         u.Names[gesture] = u.Names[item];
-                    }
-                }
-                foreach (PARAM.Row row in Params["ActionButtonParam"].Rows)
-                {
-                    Obj actionText = Obj.Of(Namespace.ActionButtonText, (int)row["textId"].Value);
-                    if (u.Names.ContainsKey(actionText))
-                    {
-                        Obj action = Obj.Of(Namespace.ActionButton, row.ID);
-                        u.Names[action] = u.Names[actionText];
                     }
                 }
                 // Can also add materials/npc lots
@@ -407,9 +539,15 @@ namespace SoulsIds
             {
                 u.Names[Obj.Of(Namespace.EventFlag, entry.Key)] = entry.Value;
             }
+            foreach (KeyValuePair<int, string> entry in editor.LoadNames("EventFlag", n => int.Parse(n), true))
+            {
+                u.Names[Obj.Of(Namespace.EventFlag, entry.Key)] = entry.Value;
+            }
         }
+
         public bool ScrapeMaps(Universe u)
         {
+            // This does not scale very well. It does not support modDir.
             if (spec.MsbDir == null) return false;
             if (spec.Game == FromGame.SDT)
             {
