@@ -163,7 +163,7 @@ O1FnLm8i4zOxVdPHQBKICkKcGS1o3C2dfwIEXw/f3w==
             }
         }
 
-        private static MemoryStream DecryptRsa(string filePath, string key)
+        public static MemoryStream DecryptRsa(string filePath, string key)
         {
             if (filePath == null)
             {
